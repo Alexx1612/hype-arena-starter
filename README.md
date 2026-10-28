@@ -49,3 +49,114 @@ MINUTES=5 scripts/check.sh       # a shorter run
 ```
 
 A run that passes here can still fail ours on what the practice data does not hold.
+
+---
+
+## Team Tzatziki — how our system is supposed to work
+
+*Added by Team Tzatziki. Everything above this line is the original starter text.*
+More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md), [`docs/EDA.md`](docs/EDA.md), [`team/README.md`](team/README.md).
+
+### The pipeline
+
+```mermaid
+flowchart LR
+  U[/"universe.csv + lexicon.json"/] --> EX
+
+  subgraph EX["1 · Extractor (Arckan)"]
+    direction TB
+    X1["Subject gazetteer<br/>lexicon names + aliases"]
+    X2["Value regexes<br/>money · quantity · percent · date · duration · version · yes/no"]
+    X3["Attribute classifier<br/>TF-IDF + LogisticRegression"]
+    X4["Page coreference<br/>He / Its / The platform"]
+    X1 --> X2 --> X3 --> X4
+  end
+
+  EX --> F[("Facts<br/>subject · attribute · value · date")]
+  GOLD[/"practice.csv gold forms<br/>(baked into the image)"/] --> KB
+  F --> KB
+
+  subgraph KB["2 · Temporal knowledge base (Ioan)"]
+    direction TB
+    K1["Timeline per subject + attribute"]
+    K2["Support votes across ~20k rows"]
+    K3["Page trust score"]
+  end
+
+  KB --> CL
+  F --> CL
+  subgraph CL["3 · Truth classifier (Arckan)"]
+    direction TB
+    C1["Features: agrees with value in force on the row's date,<br/>contradicts it, support, page trust, value kind"]
+    C2["LightGBM"]
+    C3["Isotonic calibration<br/>confidence 0.5 – 1.0"]
+    N1["Optional: CfC liquid network<br/>'value still current?' feature"]
+    C1 --> C2 --> C3
+    N1 -.-> C1
+  end
+
+  KB --> GEN["4 · Claim generator (Ioan)<br/>fact · compare · change · at_event · relation"]
+  GEN --> VAL["5 · Validator (Ioan)<br/>entry.schema.json · lexicon · claim-forms rules · not a copy"]
+  VAL -- "invalid: regenerate" --> GEN
+
+  C3 -- "~18,000 labels" --> W["6 · Writer (Ioan)<br/>temp file, then rename"]
+  VAL -- "exactly 1,000 true claims" --> W
+  W --> OUT[/"/output/output.csv"/]
+
+  OUT -.-> API["FastAPI demo API<br/>/run · /architecture · /metrics"]
+  API -.-> FE["Frontend (Vald)<br/>diagram · live run on sample.csv · metrics · /pitch"]
+```
+
+### One run inside Docker (offline, 2 CPUs, 6 GiB, 30 min)
+
+```mermaid
+sequenceDiagram
+  participant R as Arena runner
+  participant M as app/run.py
+  participant E as Extractor
+  participant K as Knowledge base
+  participant C as Classifier
+  participant G as Generator + validator
+  participant O as /output
+
+  R->>M: start as USER 10001, ARENA_DEADLINE set
+  M->>O: fallback table within 60 s (always something on disk)
+  M->>E: extract facts from all rows
+  E-->>M: facts
+  M->>K: build timelines (gold + extracted)
+  M->>C: classify unlabelled rows
+  C-->>M: labels + calibrated confidence
+  M->>G: generate and validate claims until exactly 1,000
+  G-->>M: 1,000 claims
+  M->>O: write .output.tmp, then rename to output.csv
+  Note over M,O: watchdog writes best-so-far at deadline − 90 s,<br/>SIGTERM handler writes again
+```
+
+### How a row gets its label
+
+```mermaid
+flowchart TD
+  A["Row: text + date"] --> B{"Facts extracted?"}
+  B -- no --> U1["true, low confidence<br/>(unsure only if the model is truly undecided)"]
+  B -- yes --> C{"Value in force on that date known?"}
+  C -- "matches" --> T["true, high confidence"]
+  C -- "contradicts" --> FA["false, high confidence"]
+  C -- "unknown / newer value" --> D["LightGBM on support, page trust, cues"]
+  D --> E["true / false + calibrated confidence"]
+  D -- "max probability below threshold" --> U2["unsure, no confidence"]
+```
+
+### Who builds what (4 Claude Code agents in parallel)
+
+```mermaid
+flowchart LR
+  X["X · architecture + pitch<br/>contracts.py · docs · STATUS · CLAUDE.md · pitch/"]
+  I["Ioan · backend + devops<br/>Dockerfile · run.py · KB · generator · validator · API"]
+  A["Arckan · backend + AI<br/>extractor · classifier · calibration · models · EDA"]
+  V["Vald · fullstack + frontend<br/>diagram · live run · metrics · /pitch"]
+  X -- "interfaces and stubs" --> I & A & V
+  A -- "extract() and classify()" --> I
+  I -- "/run /architecture /metrics" --> V
+  A -- "metrics.json" --> V
+  I & A & V -- "JOURNAL.md lines" --> X
+```
